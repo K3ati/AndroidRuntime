@@ -81,6 +81,7 @@ public class RuntimeService extends Service {
             Vibrator v = (Vibrator) RuntimeService.super.getSystemService(VIBRATOR_SERVICE);
             v.vibrate(500);
 
+            Log.d(TAG, "SERVICE_STOPPED_BY_USER");
             sendIPCMessage(RC_CMD.SERVICE_STOPPED_BY_USER, null);
             disconnect();
 
@@ -121,25 +122,40 @@ public class RuntimeService extends Service {
 
     @Override
     public void onDestroy() {
-        super.onDestroy();
+        Log.d(TAG, "onDestroy");
+        unregisterReceiver(stopServiceReceiver);
         notificationManger.cancel(01);
         disconnect();
+        super.onDestroy();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null) {
-            onIPCMessage(intent.getIntExtra("type", -1), intent.getExtras(), null);
+            int type = intent.getIntExtra("type", -1);
+            onIPCMessage(type, intent.getExtras(), null);
+            Log.d(TAG, "onStartCommand request: " + type);
         } else {
-            Log.d(TAG,"Null intent on onStartCommand call");
+            Log.d(TAG, "Null intent on onStartCommand call");
         }
         return START_STICKY;
     }
+
+    /*
+        FIXME:
+
+        Multiple clients can connect to the service at once. However, the system calls your
+        service's onBind() method to retrieve the IBinder only when the first client binds.
+        The system then delivers the same IBinder to any additional clients that bind,
+        without calling onBind() again.
+
+     */
 
     @Nullable
     @Override
     public IBinder onBind(Intent intent) {
         final UUID pid = UUID.randomUUID();
+        Log.d(TAG, "onBind pid=" + pid);
         processes.put(pid, (ResultReceiver) intent.getParcelableExtra("receiver"));
 
         Messenger messenger = new Messenger(new Handler() {
@@ -158,6 +174,7 @@ public class RuntimeService extends Service {
 
     protected void onIPCMessage(int type, Bundle data, UUID pid) {
 
+        Log.d(TAG, "onIPCMessage type=" + type + " pid=" + pid);
         if (pid == null) {
             //TODO: handle valid cmds
         }
@@ -287,7 +304,7 @@ public class RuntimeService extends Service {
     }
 
     protected void sendIPCMessage(int type, Bundle data) {
-        for (Map.Entry<UUID, ResultReceiver> e : processes.entrySet()){
+        for (Map.Entry<UUID, ResultReceiver> e : processes.entrySet()) {
             e.getValue().send(type, data);
         }
     }
@@ -295,9 +312,10 @@ public class RuntimeService extends Service {
     protected void sendIPCMessage(int type, Bundle data, UUID pid) {
         ResultReceiver resultReceiver = processes.get(pid);
         if (resultReceiver != null) {
+            Log.d(TAG, "sendIPCMessage type=" + type + " pid=" + pid);
             resultReceiver.send(type, data);
         } else {
-            throw new RuntimeException("Invalid process UUID");
+            throw new RuntimeException("Invalid process UUID[" + pid + "] on " + Arrays.toString(processes.keySet().toArray()));
         }
     }
 
@@ -312,8 +330,10 @@ public class RuntimeService extends Service {
     }
 
     public void onBTLost() {
-        sendIPCMessage(RC_CMD.DEVICE_LOST, null, focusedApp);
         btConnected = false;
+        if (focusedApp != null) {
+            sendIPCMessage(RC_CMD.DEVICE_LOST, null, focusedApp);
+        }
     }
 
     public void flushBTOutQueue() {
