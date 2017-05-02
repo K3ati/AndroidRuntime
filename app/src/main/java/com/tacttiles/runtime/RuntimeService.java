@@ -17,6 +17,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Message;
 import android.os.Messenger;
+import android.os.RemoteException;
 import android.os.ResultReceiver;
 import android.os.Vibrator;
 import android.support.annotation.Nullable;
@@ -28,6 +29,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -49,8 +51,8 @@ public class RuntimeService extends Service {
         public static final int SEND = 0;
         public static final int CONNECT_BT = 1;
         public static final int REQUEST_FOCUS = 2;
-        public static final int UNBIND = 3;
-
+        public static final int REGISTER = 3;
+        public static final int UNREGISTER = 4;
 
     }
 
@@ -63,8 +65,9 @@ public class RuntimeService extends Service {
     }
 
     private NotificationManager notificationManger;
-    private Map<UUID, ResultReceiver> processes;
-    private UUID focusedApp = null;
+    private Messenger messenger;
+    private ArrayList<Messenger> clients;
+    private int focusedApp = 0;
     private Queue<byte[]> btOutQ;
     private Queue<String> btInQ;
     private BluetoothAdapter btAdapter = null;
@@ -94,9 +97,17 @@ public class RuntimeService extends Service {
     public void onCreate() {
         super.onCreate();
 
-        processes = new HashMap<>();
         btOutQ = new LinkedList<>();
         btInQ = new LinkedList<>();
+        clients = new ArrayList<>();
+
+        messenger = new Messenger(new Handler() {
+            @Override
+            public void handleMessage(Message msg) {
+                onIPCMessage(msg.what, msg.getData(), msg.replyTo);
+            }
+        });
+
         IntentFilter intentFilter = new IntentFilter("STOP_TT_RUNTIME_SERVICE");
         registerReceiver(stopServiceReceiver, intentFilter);
         PendingIntent pendingIntent = PendingIntent.getBroadcast(this, 0, new Intent("STOP_TT_RUNTIME_SERVICE"), PendingIntent.FLAG_UPDATE_CURRENT);
@@ -141,41 +152,16 @@ public class RuntimeService extends Service {
         return START_STICKY;
     }
 
-    /*
-        FIXME:
-
-        Multiple clients can connect to the service at once. However, the system calls your
-        service's onBind() method to retrieve the IBinder only when the first client binds.
-        The system then delivers the same IBinder to any additional clients that bind,
-        without calling onBind() again.
-
-     */
-
     @Nullable
     @Override
     public IBinder onBind(Intent intent) {
-        final UUID pid = UUID.randomUUID();
-        Log.d(TAG, "onBind pid=" + pid);
-        processes.put(pid, (ResultReceiver) intent.getParcelableExtra("receiver"));
-
-        Messenger messenger = new Messenger(new Handler() {
-
-            private final UUID fpid = pid;
-
-            @Override
-            public void handleMessage(Message msg) {
-                onIPCMessage(msg.what, msg.getData(), pid);
-            }
-        });
-
         return messenger.getBinder();
     }
 
+    protected void onIPCMessage(int type, Bundle data, Messenger reply) {
 
-    protected void onIPCMessage(int type, Bundle data, UUID pid) {
-
-        Log.d(TAG, "onIPCMessage type=" + type + " pid=" + pid);
-        if (pid == null) {
+        Log.d(TAG, "onIPCMessage type=" + type + " pid=" + clients.indexOf(reply));
+        if (reply == null) {
             //TODO: handle valid cmds
         }
 
@@ -184,10 +170,10 @@ public class RuntimeService extends Service {
                 sendBTMessage(data.getByteArray("msg"));
                 break;
             case RS_CMD.REQUEST_FOCUS:
-                if (focusedApp != null) {
+                if (focusedApp >= 0) {
                     sendIPCMessage(RC_CMD.FOCUS_LOST, null, focusedApp);
                 }
-                focusedApp = pid;
+                focusedApp = clients.indexOf(reply);
                 if (btConnected) {
                     sendIPCMessage(RC_CMD.DEVICE_CONNECTED, null, focusedApp);
                 }
@@ -199,7 +185,7 @@ public class RuntimeService extends Service {
                         public void run() {
                             for (int i = 0; i < 3; i++) {
                                 if (connect(address)) {
-                                    if (focusedApp != null) {
+                                    if (focusedApp >= 0) {
                                         sendIPCMessage(RC_CMD.DEVICE_CONNECTED, null, focusedApp);
                                     }
                                     return;
@@ -211,18 +197,21 @@ public class RuntimeService extends Service {
                                     }
                                 }
                             }
-                            if (focusedApp != null) {
+                            if (focusedApp >= 0) {
                                 sendIPCMessage(RC_CMD.DEVICE_LOST, null, focusedApp);
                             }
                         }
                     }.start();
                 }
                 break;
-            case RS_CMD.UNBIND:
-                if (focusedApp.equals(pid)) {
-                    focusedApp = null;
+            case RS_CMD.REGISTER:
+                clients.add(reply);
+                break;
+            case RS_CMD.UNREGISTER:
+                if (focusedApp == clients.indexOf(reply)) {
+                    focusedApp = -1;
                 }
-                processes.remove(pid);
+                clients.remove(reply);
                 break;
 
             case -1:
@@ -281,46 +270,33 @@ public class RuntimeService extends Service {
 
              NOTA: Seguranca: apps precisam de permissao para adicionar triggers?
              */
-/*
-        switch (msgType) {
-            case TO_UPPER_CASE: {
-                try {
-                    // Incoming data
-                    String data = msg.getData().getString("data");
-                    Message resp = Message.obtain(null, TO_UPPER_CASE_RESPONSE);
-                    Bundle bResp = new Bundle();
-                    bResp.putString("respData", data.toUpperCase());
-                    resp.setData(bResp);
-
-                    msg.replyTo.send(resp);
-                } catch (RemoteException e) {
-                    e.printStackTrace();
-                }
-                break;
-            }
-            default:
-                super.handleMessage(msg);
-        }*/
     }
 
     protected void sendIPCMessage(int type, Bundle data) {
-        for (Map.Entry<UUID, ResultReceiver> e : processes.entrySet()) {
-            e.getValue().send(type, data);
+        for (int i = clients.size() - 1; i >= 0; i--) {
+            sendIPCMessage(type, data, i);
         }
     }
 
-    protected void sendIPCMessage(int type, Bundle data, UUID pid) {
-        ResultReceiver resultReceiver = processes.get(pid);
-        if (resultReceiver != null) {
-            Log.d(TAG, "sendIPCMessage type=" + type + " pid=" + pid);
-            resultReceiver.send(type, data);
-        } else {
-            throw new RuntimeException("Invalid process UUID[" + pid + "] on " + Arrays.toString(processes.keySet().toArray()));
+    protected void sendIPCMessage(int type, Bundle data, int pid) {
+        Messenger messenger = clients.get(pid);
+        Log.d(TAG, "sendIPCMessage type=" + type + " pid=" + pid);
+        try {
+            Message msg = Message.obtain(null, type);
+            if (data != null) {
+                msg.setData(data);
+            }
+            messenger.send(msg);
+        } catch (RemoteException e) {
+            // The client is dead.  Remove it from the list;
+            // we are going through the list from back to front
+            // so this is safe to do inside the loop.
+            clients.remove(messenger);
         }
     }
 
     public void onBTMessage(String msg) {
-        if (focusedApp == null) {
+        if (focusedApp < 0) {
             btInQ.add(msg);
         } else {
             Bundle bundle = new Bundle();
@@ -331,7 +307,7 @@ public class RuntimeService extends Service {
 
     public void onBTLost() {
         btConnected = false;
-        if (focusedApp != null) {
+        if (focusedApp >= 0) {
             sendIPCMessage(RC_CMD.DEVICE_LOST, null, focusedApp);
         }
     }
